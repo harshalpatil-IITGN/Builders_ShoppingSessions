@@ -1,0 +1,30 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.venv
+env/
+venv/
+ENV/
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Large Datasets & Generators (Must NOT be pushed to git: < 50MB repo limit)
+dev/
+out/
+dev-answer/
+generator/
+starter-duckdb/
+starter-polars/
+starter-pyspark/
+*.zip
+*.parquet
+duckdb_tmp/
+
+# Keep fixtures for testing if small, or keep tracked scripts
