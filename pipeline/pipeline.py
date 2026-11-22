@@ -13,7 +13,6 @@ if REPO_ROOT not in sys.path:
 
 from pipeline.identity import build_identity_mapping
 from pipeline.timestamp_parser import parse_iso_datetime
-from pipeline.csv_dialect import parse_csv_line
 
 DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
@@ -32,20 +31,17 @@ def check_files_have_cr(folder):
     return False
 
 def run():
-    # 1. Manifest
     with open(os.path.join(DATA, "manifest.json")) as f:
         manifest = json.load(f)
     window_start_ms = parse_iso_datetime(manifest["window_start"])
     window_end_ms = parse_iso_datetime(manifest["window_end"])
     click_window_start_ms = window_start_ms - 604800000
 
-    # Output dirs
     user_out = os.path.join(OUT, "user_daily")
     camp_out = os.path.join(OUT, "campaign_daily")
     os.makedirs(user_out, exist_ok=True)
     os.makedirs(camp_out, exist_ok=True)
 
-    # Check for empty events
     event_files = glob.glob(os.path.join(DATA, "events", "*.csv"))
     if not event_files:
         empty_ud = "SELECT NULL::VARCHAR AS user_id, NULL::DATE AS day, NULL::BIGINT AS sessions, NULL::BIGINT AS events, NULL::BIGINT AS revenue_cents, NULL::VARCHAR AS top_category WHERE false"
@@ -67,7 +63,21 @@ def run():
     con.execute(f"SET temp_directory = '{tmp_dir}'")
     con.execute("SET preserve_insertion_order = false")
 
-    # Reference tables
+    con.execute("""
+    CREATE MACRO clean_field(f) AS (
+      CASE 
+        WHEN f IS NULL OR f = '' THEN NULL
+        WHEN f LIKE '%"%' THEN 
+          CASE 
+            WHEN starts_with(f, '"') AND ends_with(f, '"') AND length(f) >= 2 AND length(replace(f, '"', '')) = length(f) - 2
+            THEN NULLIF(substr(f, 2, length(f) - 2), '')
+            ELSE '___MALFORMED___'
+          END
+        ELSE f
+      END
+    );
+    """)
+
     prod_file = os.path.join(DATA, "products.csv")
     if os.path.exists(prod_file) and os.path.getsize(prod_file) > 0:
         con.execute(f"CREATE TABLE products AS SELECT * FROM read_csv('{prod_file}', header=true, columns={{'product_id': 'VARCHAR', 'category': 'VARCHAR'}})")
@@ -80,7 +90,6 @@ def run():
     else:
         con.execute("CREATE TABLE campaigns (campaign_id VARCHAR, channel VARCHAR)")
 
-    # Identity map
     identity_map = build_identity_mapping(DATA)
     if identity_map.parent:
         all_ids = list(identity_map.parent.keys())
@@ -92,17 +101,15 @@ def run():
     else:
         con.execute("CREATE TABLE id_map (user_id VARCHAR, canonical_id VARCHAR)")
 
-    # Read events
     has_cr = check_files_have_cr(os.path.join(DATA, "events"))
     events_glob = os.path.join(DATA, "events", "*.csv").replace("\\", "/")
     if has_cr:
-        # Fallback to python reader for fixture with \\r
         from pipeline.fast_reader import load_all_events_arrow
         con.register("raw_events_arrow", load_all_events_arrow(DATA, NCPU))
         con.execute("CREATE TABLE raw_events AS SELECT * FROM raw_events_arrow")
     else:
         con.execute(f"""
-        CREATE TABLE raw_events AS 
+        CREATE TABLE raw_events_raw AS 
         SELECT 
           event_id, user_id, ts, ingest_ts, event_type, product_id, price_cents
         FROM read_csv(
@@ -120,12 +127,31 @@ def run():
           auto_detect=false,
           strict_mode=false,
           ignore_errors=true,
-          null_padding=false
-        )
-        WHERE event_id IS NOT NULL AND length(event_id) > 0;
+          null_padding=false,
+          quote='',
+          escape=''
+        );
+
+        CREATE TABLE raw_events AS
+        SELECT 
+          clean_field(event_id) AS event_id,
+          clean_field(user_id) AS user_id,
+          clean_field(ts) AS ts,
+          clean_field(ingest_ts) AS ingest_ts,
+          clean_field(event_type) AS event_type,
+          clean_field(product_id) AS product_id,
+          clean_field(price_cents) AS price_cents
+        FROM raw_events_raw
+        WHERE clean_field(event_id) IS DISTINCT FROM '___MALFORMED___'
+          AND clean_field(user_id) IS DISTINCT FROM '___MALFORMED___'
+          AND clean_field(ts) IS DISTINCT FROM '___MALFORMED___'
+          AND clean_field(ingest_ts) IS DISTINCT FROM '___MALFORMED___'
+          AND clean_field(event_type) IS DISTINCT FROM '___MALFORMED___'
+          AND clean_field(product_id) IS DISTINCT FROM '___MALFORMED___'
+          AND clean_field(price_cents) IS DISTINCT FROM '___MALFORMED___'
+          AND clean_field(event_id) IS NOT NULL;
         """)
 
-    # Read clicks
     has_cr_clicks = check_files_have_cr(os.path.join(DATA, "clicks"))
     clicks_glob = os.path.join(DATA, "clicks", "*.csv").replace("\\", "/")
     if has_cr_clicks:
@@ -134,7 +160,7 @@ def run():
         con.execute("CREATE TABLE raw_clicks AS SELECT * FROM raw_clicks_arrow")
     else:
         con.execute(f"""
-        CREATE TABLE raw_clicks AS 
+        CREATE TABLE raw_clicks_raw AS 
         SELECT 
           click_id, user_id, campaign_id, ts
         FROM read_csv(
@@ -149,12 +175,25 @@ def run():
           auto_detect=false,
           strict_mode=false,
           ignore_errors=true,
-          null_padding=false
-        )
-        WHERE click_id IS NOT NULL AND length(click_id) > 0;
+          null_padding=false,
+          quote='',
+          escape=''
+        );
+
+        CREATE TABLE raw_clicks AS
+        SELECT 
+          clean_field(click_id) AS click_id,
+          clean_field(user_id) AS user_id,
+          clean_field(campaign_id) AS campaign_id,
+          clean_field(ts) AS ts
+        FROM raw_clicks_raw
+        WHERE clean_field(click_id) IS DISTINCT FROM '___MALFORMED___'
+          AND clean_field(user_id) IS DISTINCT FROM '___MALFORMED___'
+          AND clean_field(campaign_id) IS DISTINCT FROM '___MALFORMED___'
+          AND clean_field(ts) IS DISTINCT FROM '___MALFORMED___'
+          AND clean_field(click_id) IS NOT NULL;
         """)
 
-    # Timestamp expressions
     ts_expr = """
     CASE 
       WHEN regexp_matches(ts, '^[0-9]+$') THEN try_cast(ts AS BIGINT)
@@ -167,7 +206,6 @@ def run():
     """
     ingest_expr = "(epoch(try_strptime(ingest_ts, '%Y-%m-%dT%H:%M:%SZ'))::BIGINT * 1000)"
 
-    # Dedup events on event_id keeping smallest ingest_ts BEFORE validation
     con.execute(f"""
     CREATE TABLE deduped_events AS
     WITH ranked AS (
@@ -181,7 +219,6 @@ def run():
     SELECT * EXCLUDE (rn) FROM ranked WHERE rn = 1 AND ingest_ms IS NOT NULL;
     """)
 
-    # Surviving events
     con.execute(f"""
     CREATE TABLE surviving_events AS
     SELECT 
@@ -210,7 +247,6 @@ def run():
       AND (ingest_ms - {ts_expr}) <= 86400000;
     """)
 
-    # Sessionization in SQL
     con.execute("""
     CREATE TABLE sessionized_events AS
     WITH person_distinct_ts AS (
@@ -245,7 +281,6 @@ def run():
     FROM events_with_session;
     """)
 
-    # Session summaries
     con.execute("""
     CREATE TABLE session_summary AS
     SELECT 
@@ -260,7 +295,6 @@ def run():
     GROUP BY person_id, session_num, day, session_start_ms;
     """)
 
-    # User daily table
     con.execute("""
     CREATE TABLE user_daily AS
     WITH user_cat_rev AS (
@@ -293,7 +327,6 @@ def run():
     GROUP BY s.person_id, s.day, rc.category;
     """)
 
-    # Valid clicks
     con.execute(f"""
     CREATE TABLE valid_clicks AS
     SELECT DISTINCT
@@ -310,7 +343,6 @@ def run():
       AND {ts_expr} < {window_end_ms};
     """)
 
-    # Qualifying clicks
     con.execute("""
     CREATE TABLE qualifying_clicks AS
     SELECT 
@@ -333,7 +365,6 @@ def run():
      AND s.session_start_ms - c.click_ts_ms <= 604800000;
     """)
 
-    # Credited and assisted stats
     con.execute("""
     CREATE TABLE credited_sessions AS
     SELECT 
@@ -388,7 +419,6 @@ def run():
     LEFT JOIN campaigns cmp ON a.campaign_id = cmp.campaign_id;
     """)
 
-    # Write parquet
     empty_ud = "SELECT NULL::VARCHAR AS user_id, NULL::DATE AS day, NULL::BIGINT AS sessions, NULL::BIGINT AS events, NULL::BIGINT AS revenue_cents, NULL::VARCHAR AS top_category WHERE false"
     empty_cd = "SELECT NULL::VARCHAR AS campaign_id, NULL::VARCHAR AS channel, NULL::DATE AS day, NULL::BIGINT AS sessions, NULL::BIGINT AS purchasing_sessions, NULL::BIGINT AS revenue_cents, NULL::BIGINT AS assisted_sessions WHERE false"
 
