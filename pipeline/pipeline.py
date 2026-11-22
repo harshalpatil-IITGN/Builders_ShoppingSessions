@@ -1,66 +1,87 @@
 #!/usr/bin/env python3
 """
-Shopping Sessions: DuckDB starter (skeleton).
-
-This runs end to end inside the scorer's container and writes both output tables
-with the exact schema, but the tables are EMPTY, so the checker will mark it
-incorrect. It gives you the plumbing; the rules are yours to implement.
-
-Reads  $DATA_DIR    (default /data)
-Writes $OUTPUT_DIR  (default /output): user_daily/ and campaign_daily/ as Parquet
-Temp   $SCRATCH_DIR (default /scratch)
+Shopping Sessions: End-to-end Pipeline
+Reads $DATA_DIR, processes according to rules.md, and writes
+/output/user_daily/ and /output/campaign_daily/ as Parquet.
 """
 import json
 import os
+import sys
 
-import duckdb
+# Ensure repository root is on sys.path
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+import polars as pl
+from pipeline.attribution import load_campaigns, process_clicks_and_attribute
+from pipeline.events import load_products, process_events
+from pipeline.identity import build_identity_mapping
+from pipeline.timestamp_parser import parse_iso_datetime
 
 DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
 SCRATCH = os.environ.get("SCRATCH_DIR", "/scratch")
-NCPU = int(os.environ.get("NCPU", os.cpu_count() or 1))
-MEM_GB = int(os.environ.get("MEM_GB", "8"))
 
-con = duckdb.connect()  # in-memory database
-con.execute(f"SET threads = {NCPU}")
-con.execute(f"SET memory_limit = '{max(1, int(MEM_GB * 0.8))}GB'")  # leave headroom for Python
-con.execute(f"SET temp_directory = '{os.path.join(SCRATCH, 'duckdb_tmp')}'")
-con.execute("SET preserve_insertion_order = false")
+USER_DAILY_SCHEMA = {
+    "user_id": pl.String,
+    "day": pl.Date,
+    "sessions": pl.Int64,
+    "events": pl.Int64,
+    "revenue_cents": pl.Int64,
+    "top_category": pl.String,
+}
 
-with open(os.path.join(DATA, "manifest.json")) as f:
-    manifest = json.load(f)
-print("window:", manifest["window_start"], "to", manifest["window_end"])
+CAMPAIGN_DAILY_SCHEMA = {
+    "campaign_id": pl.String,
+    "channel": pl.String,
+    "day": pl.Date,
+    "sessions": pl.Int64,
+    "purchasing_sessions": pl.Int64,
+    "revenue_cents": pl.Int64,
+    "assisted_sessions": pl.Int64,
+}
 
-events_glob = os.path.join(DATA, "events", "*.csv")
-clicks_glob = os.path.join(DATA, "clicks", "*.csv")
+def main():
+    # 1. Read manifest
+    with open(os.path.join(DATA, "manifest.json")) as f:
+        manifest = json.load(f)
+    window_start_ms = parse_iso_datetime(manifest["window_start"])
+    window_end_ms = parse_iso_datetime(manifest["window_end"])
+    
+    # 2. Build Identity Resolution Graph (Track A)
+    identity_map = build_identity_mapping(DATA)
+    products = load_products(DATA)
+    
+    # 3. Process Events & Sessionize (Track A)
+    sessions, user_daily_rows = process_events(
+        DATA, window_start_ms, window_end_ms, identity_map, products
+    )
+    
+    # 4. Process Clicks & Attribute (Track B)
+    campaigns = load_campaigns(DATA)
+    campaign_daily_rows = process_clicks_and_attribute(
+        DATA, window_start_ms, window_end_ms, identity_map, campaigns, sessions
+    )
+    
+    # 5. Output Parquet files
+    user_out_dir = os.path.join(OUT, "user_daily")
+    campaign_out_dir = os.path.join(OUT, "campaign_daily")
+    os.makedirs(user_out_dir, exist_ok=True)
+    os.makedirs(campaign_out_dir, exist_ok=True)
+    
+    if user_daily_rows:
+        df_user = pl.DataFrame(user_daily_rows, schema=USER_DAILY_SCHEMA)
+    else:
+        df_user = pl.DataFrame(schema=USER_DAILY_SCHEMA)
+    df_user.write_parquet(os.path.join(user_out_dir, "part-0.parquet"))
+    
+    if campaign_daily_rows:
+        df_camp = pl.DataFrame(campaign_daily_rows, schema=CAMPAIGN_DAILY_SCHEMA)
+    else:
+        df_camp = pl.DataFrame(schema=CAMPAIGN_DAILY_SCHEMA)
+    df_camp.write_parquet(os.path.join(campaign_out_dir, "part-0.parquet"))
 
-# TODO: implement the rules.
-#   Events: parse -> dedup on event_id (smallest ingest_ts, before validation)
-#           -> validate -> drop late -> sessionize per user (gap > 30 min)
-#           -> day of session start -> categories
-#   Clicks: parse -> dedup -> validate -> credit each session to the latest
-#           click at or before its start, within 7 days (ties: smallest click_id)
-#
-# Careful with DuckDB's CSV reader: it repairs or rejects malformed lines in its
-# own way, and it reads a quoted empty field "" as '' rather than null. Check its
-# behaviour against the fixtures before trusting it with the dialect rules.
-
-# Write both tables with the exact schema the checker expects.
-os.makedirs(os.path.join(OUT, "user_daily"), exist_ok=True)
-os.makedirs(os.path.join(OUT, "campaign_daily"), exist_ok=True)
-con.execute(f"""
-    COPY (
-        SELECT NULL::VARCHAR AS user_id, NULL::DATE AS day, NULL::BIGINT AS sessions,
-               NULL::BIGINT AS events, NULL::BIGINT AS revenue_cents, NULL::VARCHAR AS top_category
-        WHERE false
-    ) TO '{os.path.join(OUT, "user_daily", "part-0.parquet")}' (FORMAT parquet)
-""")
-con.execute(f"""
-    COPY (
-        SELECT NULL::VARCHAR AS campaign_id, NULL::VARCHAR AS channel, NULL::DATE AS day,
-               NULL::BIGINT AS sessions, NULL::BIGINT AS purchasing_sessions, NULL::BIGINT AS revenue_cents,
-               NULL::BIGINT AS assisted_sessions
-        WHERE false
-    ) TO '{os.path.join(OUT, "campaign_daily", "part-0.parquet")}' (FORMAT parquet)
-""")
-print("wrote empty user_daily and campaign_daily (skeleton)")
+if __name__ == "__main__":
+    main()
