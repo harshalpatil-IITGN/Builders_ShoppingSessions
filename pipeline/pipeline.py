@@ -1,29 +1,19 @@
 #!/usr/bin/env python3
-"""
-Accelerated Shopping Sessions Pipeline using DuckDB + PyArrow.
-Maximizes parallel execution across all 8 vCPUs and processes
-20M+ rows in seconds, with 100% rules.md compliance.
-"""
-from datetime import datetime, timezone
 import glob
 import json
 import os
 import sys
 import tempfile
+import duckdb
 
-# Ensure repository root is on sys.path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-import duckdb
-import polars as pl
-from pipeline.attribution import load_campaigns
-from pipeline.events import Session, load_products
-from pipeline.fast_reader import load_all_clicks_arrow, load_all_events_arrow
 from pipeline.identity import build_identity_mapping
 from pipeline.timestamp_parser import parse_iso_datetime
+from pipeline.csv_dialect import parse_csv_line
 
 DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
@@ -31,53 +21,40 @@ SCRATCH = os.environ.get("SCRATCH_DIR", "/scratch")
 NCPU = int(os.environ.get("NCPU", os.cpu_count() or 8))
 MEM_GB = int(os.environ.get("MEM_GB", "24"))
 
-USER_DAILY_SCHEMA = {
-    "user_id": pl.String,
-    "day": pl.Date,
-    "sessions": pl.Int64,
-    "events": pl.Int64,
-    "revenue_cents": pl.Int64,
-    "top_category": pl.String,
-}
+def check_files_have_cr(folder):
+    for fpath in glob.glob(os.path.join(folder, "*.csv")):
+        try:
+            with open(fpath, "rb") as f:
+                if b"\r" in f.read(65536):
+                    return True
+        except Exception:
+            pass
+    return False
 
-CAMPAIGN_DAILY_SCHEMA = {
-    "campaign_id": pl.String,
-    "channel": pl.String,
-    "day": pl.Date,
-    "sessions": pl.Int64,
-    "purchasing_sessions": pl.Int64,
-    "revenue_cents": pl.Int64,
-    "assisted_sessions": pl.Int64,
-}
-
-
-def build_pipeline():
-    # 1. Read manifest
+def run():
+    # 1. Manifest
     with open(os.path.join(DATA, "manifest.json")) as f:
         manifest = json.load(f)
     window_start_ms = parse_iso_datetime(manifest["window_start"])
     window_end_ms = parse_iso_datetime(manifest["window_end"])
     click_window_start_ms = window_start_ms - 604800000
 
-    # 2. Identity mapping
-    identity_map = build_identity_mapping(DATA)
-    products = load_products(DATA)
-    campaigns = load_campaigns(DATA)
+    # Output dirs
+    user_out = os.path.join(OUT, "user_daily")
+    camp_out = os.path.join(OUT, "campaign_daily")
+    os.makedirs(user_out, exist_ok=True)
+    os.makedirs(camp_out, exist_ok=True)
 
-    # 3. Read events and clicks into Arrow Tables in parallel
-    events_arrow = load_all_events_arrow(DATA, n_workers=NCPU)
-    clicks_arrow = load_all_clicks_arrow(DATA, n_workers=NCPU)
-
-    if events_arrow.num_rows == 0:
-        user_out = os.path.join(OUT, "user_daily")
-        camp_out = os.path.join(OUT, "campaign_daily")
-        os.makedirs(user_out, exist_ok=True)
-        os.makedirs(camp_out, exist_ok=True)
-        pl.DataFrame(schema=USER_DAILY_SCHEMA).write_parquet(os.path.join(user_out, "part-0.parquet"))
-        pl.DataFrame(schema=CAMPAIGN_DAILY_SCHEMA).write_parquet(os.path.join(camp_out, "part-0.parquet"))
+    # Check for empty events
+    event_files = glob.glob(os.path.join(DATA, "events", "*.csv"))
+    if not event_files:
+        empty_ud = "SELECT NULL::VARCHAR AS user_id, NULL::DATE AS day, NULL::BIGINT AS sessions, NULL::BIGINT AS events, NULL::BIGINT AS revenue_cents, NULL::VARCHAR AS top_category WHERE false"
+        empty_cd = "SELECT NULL::VARCHAR AS campaign_id, NULL::VARCHAR AS channel, NULL::DATE AS day, NULL::BIGINT AS sessions, NULL::BIGINT AS purchasing_sessions, NULL::BIGINT AS revenue_cents, NULL::BIGINT AS assisted_sessions WHERE false"
+        con = duckdb.connect()
+        con.execute(f"COPY ({empty_ud}) TO '{os.path.join(user_out, 'part-0.parquet')}' (FORMAT PARQUET)")
+        con.execute(f"COPY ({empty_cd}) TO '{os.path.join(camp_out, 'part-0.parquet')}' (FORMAT PARQUET)")
         return
 
-    # 4. Initialize DuckDB with full CPU and memory config
     con = duckdb.connect()
     con.execute(f"SET threads = {NCPU}")
     con.execute(f"SET memory_limit = '{max(1, int(MEM_GB * 0.8))}GB'")
@@ -90,25 +67,94 @@ def build_pipeline():
     con.execute(f"SET temp_directory = '{tmp_dir}'")
     con.execute("SET preserve_insertion_order = false")
 
-    # Register Arrow tables and reference catalogs
-    con.register("raw_events_arrow", events_arrow)
-    con.register("raw_clicks_arrow", clicks_arrow)
-
-    if products:
-        prod_data = [(k, v) for k, v in products.items()]
-        con.execute("CREATE TABLE products(product_id VARCHAR, category VARCHAR)")
-        con.executemany("INSERT INTO products VALUES (?, ?)", prod_data)
+    # Reference tables
+    prod_file = os.path.join(DATA, "products.csv")
+    if os.path.exists(prod_file) and os.path.getsize(prod_file) > 0:
+        con.execute(f"CREATE TABLE products AS SELECT * FROM read_csv('{prod_file}', header=true, columns={{'product_id': 'VARCHAR', 'category': 'VARCHAR'}})")
     else:
-        con.execute("CREATE TABLE products(product_id VARCHAR, category VARCHAR)")
+        con.execute("CREATE TABLE products (product_id VARCHAR, category VARCHAR)")
 
-    if campaigns:
-        camp_data = [(k, v) for k, v in campaigns.items()]
-        con.execute("CREATE TABLE campaigns(campaign_id VARCHAR, channel VARCHAR)")
-        con.executemany("INSERT INTO campaigns VALUES (?, ?)", camp_data)
+    camp_file = os.path.join(DATA, "campaigns.csv")
+    if os.path.exists(camp_file) and os.path.getsize(camp_file) > 0:
+        con.execute(f"CREATE TABLE campaigns AS SELECT * FROM read_csv('{camp_file}', header=true, columns={{'campaign_id': 'VARCHAR', 'channel': 'VARCHAR'}})")
     else:
-        con.execute("CREATE TABLE campaigns(campaign_id VARCHAR, channel VARCHAR)")
+        con.execute("CREATE TABLE campaigns (campaign_id VARCHAR, channel VARCHAR)")
 
-    # Strict timestamp parsing regex in DuckDB
+    # Identity map
+    identity_map = build_identity_mapping(DATA)
+    if identity_map.parent:
+        all_ids = list(identity_map.parent.keys())
+        canons = [identity_map.get_canonical(x) for x in all_ids]
+        import pyarrow as pa
+        id_tbl = pa.Table.from_arrays([pa.array(all_ids), pa.array(canons)], names=["user_id", "canonical_id"])
+        con.register("id_map_arrow", id_tbl)
+        con.execute("CREATE TABLE id_map AS SELECT * FROM id_map_arrow")
+    else:
+        con.execute("CREATE TABLE id_map (user_id VARCHAR, canonical_id VARCHAR)")
+
+    # Read events
+    has_cr = check_files_have_cr(os.path.join(DATA, "events"))
+    events_glob = os.path.join(DATA, "events", "*.csv").replace("\\", "/")
+    if has_cr:
+        # Fallback to python reader for fixture with \\r
+        from pipeline.fast_reader import load_all_events_arrow
+        con.register("raw_events_arrow", load_all_events_arrow(DATA, NCPU))
+        con.execute("CREATE TABLE raw_events AS SELECT * FROM raw_events_arrow")
+    else:
+        con.execute(f"""
+        CREATE TABLE raw_events AS 
+        SELECT 
+          event_id, user_id, ts, ingest_ts, event_type, product_id, price_cents
+        FROM read_csv(
+          '{events_glob}',
+          header=true,
+          columns={{
+            'event_id': 'VARCHAR',
+            'user_id': 'VARCHAR',
+            'ts': 'VARCHAR',
+            'ingest_ts': 'VARCHAR',
+            'event_type': 'VARCHAR',
+            'product_id': 'VARCHAR',
+            'price_cents': 'VARCHAR'
+          }},
+          auto_detect=false,
+          strict_mode=false,
+          ignore_errors=true,
+          null_padding=false
+        )
+        WHERE event_id IS NOT NULL AND length(event_id) > 0;
+        """)
+
+    # Read clicks
+    has_cr_clicks = check_files_have_cr(os.path.join(DATA, "clicks"))
+    clicks_glob = os.path.join(DATA, "clicks", "*.csv").replace("\\", "/")
+    if has_cr_clicks:
+        from pipeline.fast_reader import load_all_clicks_arrow
+        con.register("raw_clicks_arrow", load_all_clicks_arrow(DATA, NCPU))
+        con.execute("CREATE TABLE raw_clicks AS SELECT * FROM raw_clicks_arrow")
+    else:
+        con.execute(f"""
+        CREATE TABLE raw_clicks AS 
+        SELECT 
+          click_id, user_id, campaign_id, ts
+        FROM read_csv(
+          '{clicks_glob}',
+          header=true,
+          columns={{
+            'click_id': 'VARCHAR',
+            'user_id': 'VARCHAR',
+            'campaign_id': 'VARCHAR',
+            'ts': 'VARCHAR'
+          }},
+          auto_detect=false,
+          strict_mode=false,
+          ignore_errors=true,
+          null_padding=false
+        )
+        WHERE click_id IS NOT NULL AND length(click_id) > 0;
+        """)
+
+    # Timestamp expressions
     ts_expr = """
     CASE 
       WHEN regexp_matches(ts, '^[0-9]+$') THEN try_cast(ts AS BIGINT)
@@ -121,7 +167,7 @@ def build_pipeline():
     """
     ingest_expr = "(epoch(try_strptime(ingest_ts, '%Y-%m-%dT%H:%M:%SZ'))::BIGINT * 1000)"
 
-    # Dedup on event_id keeping smallest ingest_ts BEFORE validation
+    # Dedup events on event_id keeping smallest ingest_ts BEFORE validation
     con.execute(f"""
     CREATE TABLE deduped_events AS
     WITH ranked AS (
@@ -129,254 +175,234 @@ def build_pipeline():
         event_id, user_id, ts, ingest_ts, event_type, product_id, price_cents,
         {ingest_expr} AS ingest_ms,
         ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY {ingest_expr} ASC) AS rn
-      FROM raw_events_arrow
+      FROM raw_events
       WHERE ingest_ts IS NOT NULL
     )
     SELECT * EXCLUDE (rn) FROM ranked WHERE rn = 1 AND ingest_ms IS NOT NULL;
     """)
 
-    # Validate and filter late events
-    con.execute(f"""
-    CREATE TABLE valid_events AS
-    SELECT 
-      user_id,
-      event_type,
-      product_id,
-      CASE 
-        WHEN event_type = 'purchase' AND regexp_matches(price_cents, '^[0-9]+$') AND try_cast(price_cents AS BIGINT) BETWEEN 1 AND 10000000
-          THEN try_cast(price_cents AS BIGINT)
-        ELSE 0
-      END AS price,
-      {ts_expr} AS ts_ms,
-      ingest_ms
-    FROM deduped_events
-    WHERE user_id IS NOT NULL AND length(user_id) > 0
-      AND product_id IS NOT NULL AND length(product_id) > 0
-      AND event_type IN ('view', 'cart', 'purchase')
-      AND (
-        event_type != 'purchase' OR 
-        (regexp_matches(price_cents, '^[0-9]+$') AND try_cast(price_cents AS BIGINT) BETWEEN 1 AND 10000000)
-      );
-    """)
-
+    # Surviving events
     con.execute(f"""
     CREATE TABLE surviving_events AS
     SELECT 
-      user_id,
-      event_type,
-      product_id,
-      price,
-      ts_ms
-    FROM valid_events
-    WHERE ts_ms IS NOT NULL 
-      AND ts_ms >= {window_start_ms} 
-      AND ts_ms < {window_end_ms}
-      AND (ingest_ms - ts_ms) <= 86400000;
+      COALESCE(m.canonical_id, e.user_id) AS person_id,
+      e.event_type,
+      e.product_id,
+      COALESCE(p.category, 'unknown') AS category,
+      CASE 
+        WHEN e.event_type = 'purchase' THEN try_cast(e.price_cents AS BIGINT)
+        ELSE 0
+      END AS price,
+      {ts_expr} AS ts_ms
+    FROM deduped_events e
+    LEFT JOIN id_map m ON e.user_id = m.user_id
+    LEFT JOIN products p ON e.product_id = p.product_id
+    WHERE e.user_id IS NOT NULL AND length(e.user_id) > 0
+      AND e.product_id IS NOT NULL AND length(e.product_id) > 0
+      AND e.event_type IN ('view', 'cart', 'purchase')
+      AND (
+        e.event_type != 'purchase' OR 
+        (regexp_matches(e.price_cents, '^[0-9]+$') AND try_cast(e.price_cents AS BIGINT) BETWEEN 1 AND 10000000)
+      )
+      AND {ts_expr} IS NOT NULL
+      AND {ts_expr} >= {window_start_ms} 
+      AND {ts_expr} < {window_end_ms}
+      AND (ingest_ms - {ts_expr}) <= 86400000;
     """)
 
-    surviving_df = con.execute("SELECT user_id, event_type, product_id, price, ts_ms FROM surviving_events").fetchall()
+    # Sessionization in SQL
+    con.execute("""
+    CREATE TABLE sessionized_events AS
+    WITH person_distinct_ts AS (
+      SELECT 
+        person_id,
+        ts_ms,
+        CASE 
+          WHEN LAG(ts_ms) OVER (PARTITION BY person_id ORDER BY ts_ms ASC) IS NULL THEN 1
+          WHEN ts_ms - LAG(ts_ms) OVER (PARTITION BY person_id ORDER BY ts_ms ASC) > 1800000 THEN 1
+          ELSE 0
+        END AS is_new_session
+      FROM (SELECT DISTINCT person_id, ts_ms FROM surviving_events)
+    ),
+    ts_session AS (
+      SELECT 
+        person_id,
+        ts_ms,
+        SUM(is_new_session) OVER (PARTITION BY person_id ORDER BY ts_ms ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS session_num
+      FROM person_distinct_ts
+    ),
+    events_with_session AS (
+      SELECT 
+        e.*,
+        s.session_num
+      FROM surviving_events e
+      JOIN ts_session s ON e.person_id = s.person_id AND e.ts_ms = s.ts_ms
+    )
+    SELECT 
+      *,
+      MIN(ts_ms) OVER (PARTITION BY person_id, session_num) AS session_start_ms,
+      epoch_ms(MIN(ts_ms) OVER (PARTITION BY person_id, session_num))::DATE AS day
+    FROM events_with_session;
+    """)
 
-    # Sessionize surviving events
-    person_events = {}
-    for uid, ev_type, pid, pr, ts_val in surviving_df:
-        canonical = identity_map.get_canonical(uid)
-        if canonical not in person_events:
-            person_events[canonical] = []
-        person_events[canonical].append((ts_val, ev_type, pid, pr))
+    # Session summaries
+    con.execute("""
+    CREATE TABLE session_summary AS
+    SELECT 
+      person_id,
+      session_num,
+      day,
+      session_start_ms,
+      COUNT(*) AS session_events,
+      SUM(price) AS session_revenue,
+      MAX(CASE WHEN event_type = 'purchase' THEN 1 ELSE 0 END) AS is_purchasing
+    FROM sessionized_events
+    GROUP BY person_id, session_num, day, session_start_ms;
+    """)
 
-    all_sessions = []
-    session_counter = 0
-    user_daily_map = {}
+    # User daily table
+    con.execute("""
+    CREATE TABLE user_daily AS
+    WITH user_cat_rev AS (
+      SELECT 
+        person_id,
+        day,
+        category,
+        SUM(price) AS cat_revenue
+      FROM sessionized_events
+      WHERE event_type = 'purchase'
+      GROUP BY person_id, day, category
+    ),
+    ranked_cats AS (
+      SELECT 
+        person_id,
+        day,
+        category,
+        ROW_NUMBER() OVER (PARTITION BY person_id, day ORDER BY cat_revenue DESC, category ASC) AS rn
+      FROM user_cat_rev
+    )
+    SELECT 
+      s.person_id AS user_id,
+      s.day,
+      COUNT(*)::BIGINT AS sessions,
+      SUM(s.session_events)::BIGINT AS events,
+      SUM(s.session_revenue)::BIGINT AS revenue_cents,
+      rc.category::VARCHAR AS top_category
+    FROM session_summary s
+    LEFT JOIN ranked_cats rc ON s.person_id = rc.person_id AND s.day = rc.day AND rc.rn = 1
+    GROUP BY s.person_id, s.day, rc.category;
+    """)
 
-    for person, ev_list in person_events.items():
-        ev_list.sort(key=lambda e: e[0])
-        current_session = None
-        last_distinct_ts = None
-        session_cat_rev = {}
-
-        def finalize_session(s: Session, cat_rev: dict):
-            if s is None:
-                return
-            if cat_rev:
-                best_cat, best_rev = None, -1
-                for cat, rev in cat_rev.items():
-                    if rev > best_rev:
-                        best_rev, best_cat = rev, cat
-                    elif rev == best_rev:
-                        if best_cat is None or cat < best_cat:
-                            best_cat = cat
-                s.top_category = best_cat
-
-            key = (s.person_id, s.day_str)
-            if key not in user_daily_map:
-                user_daily_map[key] = {
-                    "user_id": s.person_id,
-                    "day": s.day_str,
-                    "sessions": 0,
-                    "events": 0,
-                    "revenue_cents": 0,
-                    "cat_rev": {}
-                }
-            ud = user_daily_map[key]
-            ud["sessions"] += 1
-            ud["events"] += s.events_count
-            ud["revenue_cents"] += s.revenue_cents
-            for c, r in cat_rev.items():
-                ud["cat_rev"][c] = ud["cat_rev"].get(c, 0) + r
-
-        for ts_val, ev_type, pid, pr in ev_list:
-            if current_session is None:
-                session_counter += 1
-                dt = datetime.fromtimestamp(ts_val / 1000, tz=timezone.utc)
-                day_str = dt.strftime("%Y-%m-%d")
-                current_session = Session(session_counter, person, ts_val, day_str)
-                last_distinct_ts = ts_val
-                session_cat_rev = {}
-                all_sessions.append(current_session)
-            else:
-                if ts_val != last_distinct_ts:
-                    if (ts_val - last_distinct_ts) > 1800000:
-                        finalize_session(current_session, session_cat_rev)
-                        session_counter += 1
-                        dt = datetime.fromtimestamp(ts_val / 1000, tz=timezone.utc)
-                        day_str = dt.strftime("%Y-%m-%d")
-                        current_session = Session(session_counter, person, ts_val, day_str)
-                        session_cat_rev = {}
-                        all_sessions.append(current_session)
-                    last_distinct_ts = ts_val
-
-            current_session.events_count += 1
-            if ev_type == "purchase":
-                current_session.is_purchasing = True
-                current_session.revenue_cents += pr
-                cat = products.get(pid, "unknown")
-                session_cat_rev[cat] = session_cat_rev.get(cat, 0) + pr
-
-        if current_session is not None:
-            finalize_session(current_session, session_cat_rev)
-
-    user_daily_rows = []
-    for (person, day_str), ud in user_daily_map.items():
-        top_cat = None
-        if ud["cat_rev"]:
-            best_cat, best_rev = None, -1
-            for cat, rev in ud["cat_rev"].items():
-                if rev > best_rev:
-                    best_rev, best_cat = rev, cat
-                elif rev == best_rev:
-                    if best_cat is None or cat < best_cat:
-                        best_cat = cat
-            top_cat = best_cat
-
-        user_daily_rows.append({
-            "user_id": person,
-            "day": datetime.strptime(day_str, "%Y-%m-%d").date(),
-            "sessions": ud["sessions"],
-            "events": ud["events"],
-            "revenue_cents": ud["revenue_cents"],
-            "top_category": top_cat
-        })
-
-    # Clicks validation and dedup
+    # Valid clicks
     con.execute(f"""
     CREATE TABLE valid_clicks AS
     SELECT DISTINCT
-      click_id,
-      user_id,
-      campaign_id,
-      {ts_expr} AS ts_ms
-    FROM raw_clicks_arrow
-    WHERE user_id IS NOT NULL AND length(user_id) > 0
-      AND campaign_id IN (SELECT campaign_id FROM campaigns)
+      c.click_id,
+      COALESCE(m.canonical_id, c.user_id) AS person_id,
+      c.campaign_id,
+      {ts_expr} AS click_ts_ms
+    FROM raw_clicks c
+    LEFT JOIN id_map m ON c.user_id = m.user_id
+    WHERE c.user_id IS NOT NULL AND length(c.user_id) > 0
+      AND c.campaign_id IN (SELECT campaign_id FROM campaigns)
       AND {ts_expr} IS NOT NULL
       AND {ts_expr} >= {click_window_start_ms}
       AND {ts_expr} < {window_end_ms};
     """)
 
-    valid_clicks_df = con.execute("SELECT click_id, user_id, campaign_id, ts_ms FROM valid_clicks").fetchall()
+    # Qualifying clicks
+    con.execute("""
+    CREATE TABLE qualifying_clicks AS
+    SELECT 
+      s.person_id,
+      s.session_num,
+      s.day,
+      s.is_purchasing,
+      s.session_revenue,
+      c.click_id,
+      c.campaign_id,
+      c.click_ts_ms,
+      ROW_NUMBER() OVER (
+        PARTITION BY s.person_id, s.session_num 
+        ORDER BY c.click_ts_ms DESC, c.click_id ASC
+      ) AS rn
+    FROM session_summary s
+    JOIN valid_clicks c 
+      ON s.person_id = c.person_id 
+     AND c.click_ts_ms <= s.session_start_ms 
+     AND s.session_start_ms - c.click_ts_ms <= 604800000;
+    """)
 
-    person_clicks = {}
-    for cid, uid, cmp_id, c_ts in valid_clicks_df:
-        canonical = identity_map.get_canonical(uid)
-        if canonical not in person_clicks:
-            person_clicks[canonical] = []
-        person_clicks[canonical].append((cid, cmp_id, c_ts))
+    # Credited and assisted stats
+    con.execute("""
+    CREATE TABLE credited_sessions AS
+    SELECT 
+      s.person_id,
+      s.session_num,
+      s.day,
+      s.is_purchasing,
+      s.session_revenue,
+      COALESCE(q.campaign_id, 'organic') AS campaign_id
+    FROM session_summary s
+    LEFT JOIN (SELECT * FROM qualifying_clicks WHERE rn = 1) q
+      ON s.person_id = q.person_id AND s.session_num = q.session_num;
 
-    camp_daily_map = {}
-    def get_camp_entry(c_id: str, day_str: str) -> dict:
-        key = (c_id, day_str)
-        if key not in camp_daily_map:
-            channel = "organic" if c_id == "organic" else campaigns.get(c_id, "")
-            camp_daily_map[key] = {
-                "campaign_id": c_id,
-                "channel": channel,
-                "day": day_str,
-                "sessions": 0,
-                "purchasing_sessions": 0,
-                "revenue_cents": 0,
-                "assisted_sessions": 0,
-            }
-        return camp_daily_map[key]
+    CREATE TABLE credited_stats AS
+    SELECT 
+      campaign_id,
+      day,
+      COUNT(*)::BIGINT AS sessions,
+      SUM(is_purchasing)::BIGINT AS purchasing_sessions,
+      SUM(session_revenue)::BIGINT AS revenue_cents
+    FROM credited_sessions
+    GROUP BY campaign_id, day;
 
-    SEVEN_DAYS_MS = 604800000
+    CREATE TABLE assisted_stats AS
+    SELECT 
+      campaign_id,
+      day,
+      COUNT(DISTINCT (person_id, session_num))::BIGINT AS assisted_sessions
+    FROM qualifying_clicks
+    GROUP BY campaign_id, day;
 
-    for s in all_sessions:
-        clicks = person_clicks.get(s.person_id, [])
-        qualifying = [
-            c for c in clicks 
-            if c[2] <= s.start_ts and (s.start_ts - c[2]) <= SEVEN_DAYS_MS
-        ]
+    CREATE TABLE all_camp_days AS
+    SELECT campaign_id, day FROM credited_stats
+    UNION
+    SELECT campaign_id, day FROM assisted_stats;
 
-        if not qualifying:
-            entry = get_camp_entry("organic", s.day_str)
-            entry["sessions"] += 1
-            if s.is_purchasing:
-                entry["purchasing_sessions"] += 1
-            entry["revenue_cents"] += s.revenue_cents
-        else:
-            qualifying.sort(key=lambda c: (-c[2], c[0]))
-            winner = qualifying[0]
-            entry = get_camp_entry(winner[1], s.day_str)
-            entry["sessions"] += 1
-            if s.is_purchasing:
-                entry["purchasing_sessions"] += 1
-            entry["revenue_cents"] += s.revenue_cents
+    CREATE TABLE campaign_daily AS
+    SELECT 
+      a.campaign_id::VARCHAR AS campaign_id,
+      CASE 
+        WHEN a.campaign_id = 'organic' THEN 'organic'
+        ELSE cmp.channel
+      END::VARCHAR AS channel,
+      a.day,
+      COALESCE(cs.sessions, 0)::BIGINT AS sessions,
+      COALESCE(cs.purchasing_sessions, 0)::BIGINT AS purchasing_sessions,
+      COALESCE(cs.revenue_cents, 0)::BIGINT AS revenue_cents,
+      COALESCE(ast.assisted_sessions, 0)::BIGINT AS assisted_sessions
+    FROM all_camp_days a
+    LEFT JOIN credited_stats cs ON a.campaign_id = cs.campaign_id AND a.day = cs.day
+    LEFT JOIN assisted_stats ast ON a.campaign_id = ast.campaign_id AND a.day = ast.day
+    LEFT JOIN campaigns cmp ON a.campaign_id = cmp.campaign_id;
+    """)
 
-            assisting_camps = {c[1] for c in qualifying}
-            for c_id in assisting_camps:
-                c_entry = get_camp_entry(c_id, s.day_str)
-                c_entry["assisted_sessions"] += 1
+    # Write parquet
+    empty_ud = "SELECT NULL::VARCHAR AS user_id, NULL::DATE AS day, NULL::BIGINT AS sessions, NULL::BIGINT AS events, NULL::BIGINT AS revenue_cents, NULL::VARCHAR AS top_category WHERE false"
+    empty_cd = "SELECT NULL::VARCHAR AS campaign_id, NULL::VARCHAR AS channel, NULL::DATE AS day, NULL::BIGINT AS sessions, NULL::BIGINT AS purchasing_sessions, NULL::BIGINT AS revenue_cents, NULL::BIGINT AS assisted_sessions WHERE false"
 
-    campaign_daily_rows = []
-    for (c_id, day_str), data in camp_daily_map.items():
-        campaign_daily_rows.append({
-            "campaign_id": data["campaign_id"],
-            "channel": data["channel"],
-            "day": datetime.strptime(day_str, "%Y-%m-%d").date(),
-            "sessions": data["sessions"],
-            "purchasing_sessions": data["purchasing_sessions"],
-            "revenue_cents": data["revenue_cents"],
-            "assisted_sessions": data["assisted_sessions"],
-        })
-
-    # Output Parquet
-    user_out_dir = os.path.join(OUT, "user_daily")
-    campaign_out_dir = os.path.join(OUT, "campaign_daily")
-    os.makedirs(user_out_dir, exist_ok=True)
-    os.makedirs(campaign_out_dir, exist_ok=True)
-
-    if user_daily_rows:
-        df_user = pl.DataFrame(user_daily_rows, schema=USER_DAILY_SCHEMA)
+    ud_count = con.execute("SELECT count(*) FROM user_daily").fetchone()[0]
+    if ud_count > 0:
+        con.execute(f"COPY user_daily TO '{os.path.join(user_out, 'part-0.parquet')}' (FORMAT PARQUET)")
     else:
-        df_user = pl.DataFrame(schema=USER_DAILY_SCHEMA)
-    df_user.write_parquet(os.path.join(user_out_dir, "part-0.parquet"))
+        con.execute(f"COPY ({empty_ud}) TO '{os.path.join(user_out, 'part-0.parquet')}' (FORMAT PARQUET)")
 
-    if campaign_daily_rows:
-        df_camp = pl.DataFrame(campaign_daily_rows, schema=CAMPAIGN_DAILY_SCHEMA)
+    cd_count = con.execute("SELECT count(*) FROM campaign_daily").fetchone()[0]
+    if cd_count > 0:
+        con.execute(f"COPY campaign_daily TO '{os.path.join(camp_out, 'part-0.parquet')}' (FORMAT PARQUET)")
     else:
-        df_camp = pl.DataFrame(schema=CAMPAIGN_DAILY_SCHEMA)
-    df_camp.write_parquet(os.path.join(campaign_out_dir, "part-0.parquet"))
-
+        con.execute(f"COPY ({empty_cd}) TO '{os.path.join(camp_out, 'part-0.parquet')}' (FORMAT PARQUET)")
 
 if __name__ == "__main__":
-    build_pipeline()
+    run()
