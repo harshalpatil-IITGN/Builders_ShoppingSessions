@@ -125,7 +125,7 @@ def run():
             'price_cents': 'VARCHAR'
           }},
           auto_detect=false,
-          strict_mode=false,
+          strict_mode=true,
           ignore_errors=true,
           null_padding=false,
           quote='',
@@ -173,7 +173,7 @@ def run():
             'ts': 'VARCHAR'
           }},
           auto_detect=false,
-          strict_mode=false,
+          strict_mode=true,
           ignore_errors=true,
           null_padding=false,
           quote='',
