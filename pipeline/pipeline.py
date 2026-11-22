@@ -53,7 +53,7 @@ def run():
 
     con = duckdb.connect()
     con.execute(f"SET threads = {NCPU}")
-    con.execute(f"SET memory_limit = '{max(1, int(MEM_GB * 0.85))}GB'")
+    con.execute(f"SET memory_limit = '{max(1, int(MEM_GB * 0.8))}GB'")
     try:
         tmp_dir = os.path.join(SCRATCH, "duckdb_tmp")
         os.makedirs(tmp_dir, exist_ok=True)
@@ -106,7 +106,7 @@ def run():
     if has_cr:
         from pipeline.fast_reader import load_all_events_arrow
         con.register("raw_events_arrow", load_all_events_arrow(DATA, NCPU))
-        con.execute("CREATE VIEW raw_events AS SELECT * FROM raw_events_arrow")
+        con.execute("CREATE TABLE raw_events AS SELECT * FROM raw_events_arrow")
     else:
         con.execute(f"""
         CREATE VIEW raw_events_raw AS 
@@ -160,7 +160,7 @@ def run():
     if has_cr_clicks:
         from pipeline.fast_reader import load_all_clicks_arrow
         con.register("raw_clicks_arrow", load_all_clicks_arrow(DATA, NCPU))
-        con.execute("CREATE VIEW raw_clicks AS SELECT * FROM raw_clicks_arrow")
+        con.execute("CREATE TABLE raw_clicks AS SELECT * FROM raw_clicks_arrow")
     else:
         con.execute(f"""
         CREATE VIEW raw_clicks_raw AS 
@@ -212,21 +212,17 @@ def run():
     """
     ingest_expr = "(epoch(try_strptime(ingest_ts, '%Y-%m-%dT%H:%M:%SZ'))::BIGINT * 1000)"
 
-    # Fast dedup: string comparison on ISO ingest_ts is 50x faster than parsing date!
     con.execute(f"""
     CREATE TABLE deduped_events AS
     WITH ranked AS (
       SELECT 
         event_id, user_id, ts, ingest_ts, event_type, product_id, price_cents,
-        ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY ingest_ts ASC) AS rn
+        {ingest_expr} AS ingest_ms,
+        ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY {ingest_expr} ASC) AS rn
       FROM raw_events
       WHERE ingest_ts IS NOT NULL
     )
-    SELECT 
-      event_id, user_id, ts, event_type, product_id, price_cents,
-      {ingest_expr} AS ingest_ms
-    FROM ranked 
-    WHERE rn = 1;
+    SELECT * EXCLUDE (rn) FROM ranked WHERE rn = 1 AND ingest_ms IS NOT NULL;
     """)
 
     con.execute(f"""
@@ -257,30 +253,38 @@ def run():
       AND (ingest_ms - {ts_expr}) <= 86400000;
     """)
 
-    # Vectorized sessionization in one pass without self-join
     con.execute("""
     CREATE TABLE sessionized_events AS
-    WITH marked AS (
+    WITH person_distinct_ts AS (
       SELECT 
-        *,
+        person_id,
+        ts_ms,
         CASE 
           WHEN LAG(ts_ms) OVER (PARTITION BY person_id ORDER BY ts_ms ASC) IS NULL THEN 1
           WHEN ts_ms - LAG(ts_ms) OVER (PARTITION BY person_id ORDER BY ts_ms ASC) > 1800000 THEN 1
           ELSE 0
         END AS is_new_session
-      FROM surviving_events
+      FROM (SELECT DISTINCT person_id, ts_ms FROM surviving_events)
     ),
-    with_session AS (
+    ts_session AS (
       SELECT 
-        *,
+        person_id,
+        ts_ms,
         SUM(is_new_session) OVER (PARTITION BY person_id ORDER BY ts_ms ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS session_num
-      FROM marked
+      FROM person_distinct_ts
+    ),
+    events_with_session AS (
+      SELECT 
+        e.*,
+        s.session_num
+      FROM surviving_events e
+      JOIN ts_session s ON e.person_id = s.person_id AND e.ts_ms = s.ts_ms
     )
     SELECT 
       *,
       MIN(ts_ms) OVER (PARTITION BY person_id, session_num) AS session_start_ms,
       epoch_ms(MIN(ts_ms) OVER (PARTITION BY person_id, session_num))::DATE AS day
-    FROM with_session;
+    FROM events_with_session;
     """)
 
     con.execute("""
